@@ -3,7 +3,11 @@
     "todo_crud_backend": {
       "candid": "src/todo_crud_backend/todo_crud_backend.did",
       "package": "todo_crud_backend",
-      "type": "rust"
+      "type": "rust",
+      "local": {
+    "bind": "127.0.0.1:8888",
+    "type": "ephemeral"
+  }
     }
   },
   "defaults": {

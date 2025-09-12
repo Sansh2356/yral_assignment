@@ -1,3 +1,30 @@
-service : {
-    "greet": (text) -> (text) query;
+type HttpRequest = record {
+  url : text;
+  method : text;
+  body : blob;
+  headers : vec record { text; text };
+};
+type HttpResponse = record {
+  body : blob;
+  headers : vec record { text; text };
+  upgrade : opt bool;
+  status_code : nat16;
+};
+type HttpUpdateRequest = record {
+    method: text;
+    url: text;
+    headers: vec record { text; text };
+    body: blob;
+};
+type Todo = record { id : nat64; "text" : text };
+service : () -> {
+  add_todo : (text) -> (nat64);
+  delete_todo : (nat64) -> (bool);
+  get_all_todos : () -> (vec Todo) query;
+  get_randomness : () -> (blob) query;
+  get_todo : (nat64) -> (opt Todo) query;
+  http_request : (HttpRequest) -> (HttpResponse) query;
+  http_request_update : (HttpRequest) -> (HttpResponse);
+  list_todos_paginated : (nat64, nat64) -> (vec Todo) query;
+  update_todo : (nat64, text) -> (bool);
 }
