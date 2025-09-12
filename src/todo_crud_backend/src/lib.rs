@@ -13,6 +13,7 @@ use ic_stable_structures::{
 };
 use regex::Regex;
 use serde::Serialize;
+use serde_json::json;
 use std::ops::DerefMut;
 use std::{borrow::Cow, cell::RefCell, collections::HashMap};
 pub mod error;
@@ -356,6 +357,17 @@ fn http_request_update(request: HttpUpdateRequest) -> ic_http_certification::Htt
             return create_not_found_response();
         }
     }
+    if path.starts_with("/addnewTodo") {
+        let body_json = String::from_utf8_lossy(&request.body);
+        println!("Request body for update: {}", body_json);
+        let val: UpdateRequestBody = serde_json::from_str(&body_json).unwrap();
+        let response_new_id = add_todo(val.new_text);
+        let body_json = json!({
+            "new_job_id":response_new_id,
+        });
+        let jsonify_body = serde_json::to_string(&body_json);
+        return json_response_GET(200, jsonify_body.unwrap(), false);
+    }
     add_skip_certification_header(data_certificate().unwrap(), &mut response);
     ic_cdk::println!(
         "Response generated for the corresponding request - {:?}",
@@ -394,7 +406,10 @@ fn http_request(request: HttpRequest) -> ic_http_certification::HttpResponse<'st
                     }
                 };
             }
-            if path.starts_with("/deleteTodo") || path.starts_with("/updateTodo") {
+            if path.starts_with("/deleteTodo")
+                || path.starts_with("/updateTodo")
+                || path.starts_with("/addnewTodo")
+            {
                 //Update the corresponding call to direct the `HttpGateway response` to `http_update_request` instead
                 return json_response_GET(200, "".to_string(), true);
             }
