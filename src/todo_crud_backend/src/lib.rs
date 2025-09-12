@@ -11,10 +11,11 @@ use ic_stable_structures::{
     memory_manager::{MemoryId, MemoryManager, VirtualMemory},
     DefaultMemoryImpl, StableBTreeMap, Storable,
 };
+use matchit::{Params, Router};
 use regex::Regex;
 use serde::Serialize;
 use serde_json::json;
-use std::ops::DerefMut;
+use std::ops::{Bound, DerefMut};
 use std::{borrow::Cow, cell::RefCell, collections::HashMap};
 pub mod error;
 /*
@@ -27,7 +28,7 @@ For generating the candid files one can use the following instructions
 #[derive(Clone, Debug, CandidType, Deserialize, Serialize)]
 pub struct HeaderField(pub String, pub String);
 
-#[derive(Clone, Debug, CandidType, Deserialize)]
+#[derive(Clone, Debug, CandidType, Deserialize, Serialize)]
 pub struct HttpRequest {
     pub method: String,
     pub url: String,
@@ -86,6 +87,7 @@ impl Storable for Todo {
         serialized_struct
     }
 }
+pub type RouteHandler = for<'a> fn(&'a HttpRequest, &'a Params) -> HttpResponse<'static>;
 //TODO: Memory will be changed after initial commits
 thread_local! {
     static MEMORY_MANAGER: RefCell<MemoryManager<DefaultMemoryImpl>> =
@@ -101,12 +103,44 @@ thread_local! {
             1,
         )
     );
-    // static TODOS: RefCell<HashMap<u64, Todo>> = RefCell::new(HashMap::new());
-    // static NEXT_ID:RefCell<u64> = RefCell::new(u64::from_str_radix("1", 16).unwrap());
+    //Simple zero copy routers instead of static matching of regex expressions
+    static QUERY_ROUTER: RefCell<Router<RouteHandler>> = RefCell::new(Router::new());
+    static UPDATE_ROUTER: RefCell<Router<RouteHandler>> = RefCell::new(Router::new());
+
+}
+//Instead of parsing via regex using zero-copying simple router instead
+fn build_query_router() {
+    QUERY_ROUTER.with(|router| {
+        router
+            .borrow_mut()
+            .insert("/allTodos", get_all_todos_handler);
+        router
+            .borrow_mut()
+            .insert("/getTodo/{id}", get_task_handler);
+        router.borrow_mut().insert(
+            "/getpaginatedTodos/{page}/{limit}",
+            paginated_read_task_handler,
+        );
+    });
+}
+fn build_update_router() {
+    UPDATE_ROUTER.with(|router| {
+        router
+            .borrow_mut()
+            .insert("/createnewTodo", add_new_task_handler);
+        router
+            .borrow_mut()
+            .insert("/updateTodo/{id}", update_task_handler);
+        router
+            .borrow_mut()
+            .insert("/deleteTodo/{id}", delete_task_handler);
+    });
 }
 #[ic_cdk::init]
 fn init() {
     certified_data_set(&skip_certification_certified_data());
+    build_query_router();
+    build_update_router();
     println!("Canister Initialization complete.");
 }
 #[ic_cdk::update]
@@ -142,16 +176,21 @@ fn get_todo(id: u64) -> Option<Todo> {
 fn list_todos_paginated(page: u64, limit: u64) -> Vec<Todo> {
     println!("Listing todos page: {}, limit: {}", page, limit);
     TODOS.with(|todos| {
-        let todos_vec: Vec<Todo> = todos.borrow().values().collect();
-        println!("Total todos available: {}", todos_vec.len());
-        let start = ((page.saturating_sub(1)) * limit) as usize;
-        let end = std::cmp::min(start + (limit as usize), todos_vec.len());
-        println!("Pagination range: start={}, end={}", start, end);
-        if start >= todos_vec.len() {
+        println!("Total tasks present in mapping {}", todos.borrow().len());
+        //The offset factor will be ((page_size-1)*limit)
+        let start = ((page - 1) * limit) as usize;
+        //Handling the final case of exceeding the last page
+        let end = std::cmp::min(start + (limit as usize), todos.borrow().len() as usize);
+        println!("Pagination from {},{}", start, end);
+        if start >= todos.borrow().len() as usize {
             println!("Start index exceeds todos length, returning empty list");
             vec![]
         } else {
-            todos_vec[start..end].to_vec()
+            //Range based queries in `BTreeMap` instead
+            todos
+                .borrow()
+                .values_range((Bound::Included(start as u64), Bound::Included(end as u64)))
+                .collect()
         }
     })
 }
@@ -215,11 +254,18 @@ fn json_response_GET(
     HttpResponse::ok(
         Cow::Owned(Vec::from(byte_body)),
         vec![
-            ("Content-Type".to_string(), "".to_string()),
+            ("content-type".to_string(), "application/json".to_string()),
             (
-                "Cache-Control".to_string(),
-                "public, max-age=31536000, immutable".to_string(),
+                "strict-transport-security".to_string(),
+                "max-age=31536000; includeSubDomains".to_string(),
             ),
+            ("x-content-type-options".to_string(), "nosniff".to_string()),
+            ("referrer-policy".to_string(), "no-referrer".to_string()),
+            (
+                "cache-control".to_string(),
+                "no-store, max-age=0".to_string(),
+            ),
+            ("pragma".to_string(), "no-cache".to_string()),
         ],
     )
     .with_upgrade(update_call_or_not)
@@ -233,83 +279,85 @@ fn create_not_found_response() -> HttpResponse<'static> {
     )
     .build()
 }
-fn get_task_handler(url: &str) -> Option<Todo> {
-    println!("Handling get task from URL: {}", url);
-    let re = Regex::new(r"^/getTodo/(\d+)$").unwrap();
+fn get_task_handler(request: &HttpRequest, params: &Params) -> HttpResponse<'static> {
+    let task_id_parsed: u64 = params.get("id").unwrap().parse().unwrap();
+    println!("Parsed id: {}", task_id_parsed);
 
-    if let Some(captures) = re.captures(url) {
-        if let Some(matched_id) = captures.get(1) {
-            println!("Extracted id from URL: {}", matched_id.as_str());
-            if let Ok(task_id_parsed) = matched_id.as_str().parse::<u64>() {
-                println!("Parsed id: {}", task_id_parsed);
-                if let Some(fetched_task) =
-                    TODOS.with(|todo_task| todo_task.borrow().get(&task_id_parsed))
-                {
-                    println!("Found todo: {:?}", fetched_task);
-                    return Some(fetched_task);
-                } else {
-                    println!("Todo not found for id: {}", task_id_parsed);
-                }
-            }
-        }
+    println!("Parsed id: {}", task_id_parsed);
+    if let Some(fetched_task) = TODOS.with(|todo_task| todo_task.borrow().get(&task_id_parsed)) {
+        println!("Found todo: {:?}", fetched_task);
+        let json_str = serde_json::to_string(&fetched_task).unwrap();
+        return json_response_GET(200, json_str, false);
     }
-
-    None
-}
-fn delete_task_handler(url: &str) -> bool {
-    println!("Handling delete task from URL: {}", url);
-    let re = Regex::new(r"^/deleteTodo/(\d+)$").unwrap();
-    if let Some(captures) = re.captures(url) {
-        if let Some(matched_id) = captures.get(1) {
-            println!("Extracted id from URL: {}", matched_id.as_str());
-            if let Ok(task_id_parsed) = matched_id.as_str().parse::<u64>() {
-                println!("Parsed id: {}", task_id_parsed);
-                if let Some(_) =
-                    TODOS.with(|todo_tasks| todo_tasks.borrow_mut().remove(&task_id_parsed))
-                {
-                    println!("Deleted todo with id: {}", task_id_parsed);
-                    return true;
-                } else {
-                    println!("No todo found to delete for id: {}", task_id_parsed);
-                }
-            }
-        }
-    }
-    false
-}
-fn update_task_handler(url: &str, new_text: String) -> bool {
     println!(
-        "Handling update task from URL: {}, new text: {}",
-        url, new_text
+        "No todo found in existing storage for id: {}",
+        task_id_parsed
     );
-    let re = Regex::new(r"^/updateTodo/(\d+)$").unwrap();
-    if let Some(captures) = re.captures(url) {
-        if let Some(matched_id) = captures.get(1) {
-            println!("Extracted id from URL: {}", matched_id.as_str());
-            if let Ok(task_id_parsed) = matched_id.as_str().parse::<u64>() {
-                println!("Parsed id: {}", task_id_parsed);
-                if let Some(_) = TODOS.with(|todo_tasks| {
-                    println!(
-                        "Updating todo with id {} to new text {}",
-                        task_id_parsed, new_text
-                    );
-                    todo_tasks.borrow_mut().insert(
-                        task_id_parsed,
-                        Todo {
-                            id: task_id_parsed,
-                            text: new_text,
-                        },
-                    )
-                }) {
-                    println!("Todo updated successfully for id: {}", task_id_parsed);
-                    return true;
-                } else {
-                    println!("Todo insertion failed for id: {}", task_id_parsed);
-                }
-            }
-        }
+    return create_not_found_response();
+}
+fn paginated_read_task_handler(request: &HttpRequest, params: &Params) -> HttpResponse<'static> {
+    let page = params.get("page").unwrap().parse::<u64>().unwrap();
+    let limit = params.get("limit").unwrap().parse::<u64>().unwrap();
+    let fetched_todo_vec = list_todos_paginated(page, limit);
+    let resp_body = serde_json::to_string(&fetched_todo_vec).unwrap();
+
+    json_response_GET(200, resp_body, false)
+}
+fn delete_task_handler(request: &HttpRequest, params: &Params) -> HttpResponse<'static> {
+    let task_id_parsed: u64 = params.get("id").unwrap().parse().unwrap();
+    println!("Parsed id: {}", task_id_parsed);
+    if let Some(_) = TODOS.with(|todo_tasks| todo_tasks.borrow_mut().remove(&task_id_parsed)) {
+        println!("Deleted todo with id: {}", task_id_parsed);
+        return json_response_GET(200, true.to_string(), false);
+    } else {
+        println!("No todo found to delete for id: {}", task_id_parsed);
+        return create_not_found_response();
     }
-    false
+}
+fn update_task_handler(request: &HttpRequest, params: &Params) -> HttpResponse<'static> {
+    let task_id_parsed: u64 = params.get("id").unwrap().parse().unwrap();
+    println!("Parsed id: {}", task_id_parsed);
+    let body_json = String::from_utf8_lossy(&request.body);
+    println!("Request body for update: {}", body_json);
+    let val: UpdateRequestBody = serde_json::from_str(&body_json).unwrap();
+
+    if let Some(_) = TODOS.with(|todo_tasks| {
+        println!(
+            "Updating todo with id {} to new text {}",
+            task_id_parsed, val.new_text
+        );
+        todo_tasks.borrow_mut().insert(
+            task_id_parsed,
+            Todo {
+                id: task_id_parsed,
+                text: val.new_text,
+            },
+        )
+    }) {
+        println!("Todo updated successfully for id: {}", task_id_parsed);
+        println!("Task updated successfully");
+        return json_response_GET(200, true.to_string(), false);
+    }
+    println!("Task update failed");
+    return create_not_found_response();
+}
+fn get_all_todos_handler(request: &HttpRequest, params: &Params) -> HttpResponse<'static> {
+    println!("Matched route: GET /allTodos");
+    let todos = TODOS.with(|todos| todos.borrow().values().collect::<Vec<Todo>>());
+    println!("Fetched todos: {:?}", todos);
+    let body = serde_json::to_string(&todos).unwrap();
+    json_response_GET(200, body, false)
+}
+fn add_new_task_handler(request: &HttpRequest, params: &Params) -> HttpResponse<'static> {
+    let body_json = String::from_utf8_lossy(&request.body);
+    println!("Request body for update: {}", body_json);
+    let val: UpdateRequestBody = serde_json::from_str(&body_json).unwrap();
+    let response_new_id = add_todo(val.new_text);
+    let body_json = json!({
+        "new_job_id":response_new_id,
+    });
+    let jsonify_body = serde_json::to_string(&body_json);
+    return json_response_GET(200, jsonify_body.unwrap(), false);
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct UpdateRequestBody {
@@ -328,52 +376,25 @@ then try above endpoints via - <canister-d>.raw.localhost instead of <canister-i
 */
 #[ic_cdk::update]
 //It will serve only the POST/PUT/PATCH/DELETE requests
-fn http_request_update(request: HttpUpdateRequest) -> ic_http_certification::HttpResponse<'static> {
+fn http_request_update(request: HttpRequest) -> ic_http_certification::HttpResponse<'static> {
     ic_cdk::println!("Received request for DELETE/PUT/PATCH is - : {:?}", request);
     let path = request.url.as_str();
     let method = request.method.as_str();
     println!("Request method: {}, path: {}", method, path);
-    let mut response = create_not_found_response();
-    if path.starts_with("/deleteTodo") {
-        println!("Matched route: DELETE /deleteTodo");
-        if delete_task_handler(&request.url) == true {
-            println!("Task deleted successfully");
-            return json_response_GET(200, true.to_string(), false);
-        } else {
-            println!("Task deletion failed");
-            return create_not_found_response();
-        }
-    }
-    if path.starts_with("/updateTodo") {
-        println!("Matched route: PUT /updateTodo");
-        let body_json = String::from_utf8_lossy(&request.body);
-        println!("Request body for update: {}", body_json);
-        let val: UpdateRequestBody = serde_json::from_str(&body_json).unwrap();
-        if update_task_handler(&request.url, val.new_text) == true {
-            println!("Task updated successfully");
-            return json_response_GET(200, true.to_string(), false);
-        } else {
-            println!("Task update failed");
-            return create_not_found_response();
-        }
-    }
-    if path.starts_with("/addnewTodo") {
-        let body_json = String::from_utf8_lossy(&request.body);
-        println!("Request body for update: {}", body_json);
-        let val: UpdateRequestBody = serde_json::from_str(&body_json).unwrap();
-        let response_new_id = add_todo(val.new_text);
-        let body_json = json!({
-            "new_job_id":response_new_id,
-        });
-        let jsonify_body = serde_json::to_string(&body_json);
-        return json_response_GET(200, jsonify_body.unwrap(), false);
-    }
-    add_skip_certification_header(data_certificate().unwrap(), &mut response);
-    ic_cdk::println!(
-        "Response generated for the corresponding request - {:?}",
-        response
-    );
-    response
+    let resp = UPDATE_ROUTER.with_borrow(|router| {
+        match router.at(path) {
+            Ok(route_handler_matching) => {
+                let route_handler = route_handler_matching.value;
+                let response = route_handler(&request, &route_handler_matching.params);
+                ic_cdk::println!("samdvncxvnxcnvc - {:?}", response);
+                return response;
+            }
+            Err(error) => {
+                panic!("{:?}", error);
+            }
+        };
+    });
+    resp
 }
 #[ic_cdk::query]
 //It will serve only GET requests i.e are the query ones
@@ -381,49 +402,29 @@ fn http_request(request: HttpRequest) -> ic_http_certification::HttpResponse<'st
     ic_cdk::println!("Received request for GET is - : {:?}", request);
     let path = request.url.as_str();
     let method = request.method.as_str();
-    println!("Request method: {}, path: {}", method, path);
-
-    let mut response = match (method, path) {
-        ("GET", "/allTodos") => {
-            println!("Matched route: GET /allTodos");
-            let todos = TODOS.with(|todos| todos.borrow().values().collect::<Vec<Todo>>());
-            println!("Fetched todos: {:?}", todos);
-            let body = serde_json::to_string(&todos).unwrap();
-            json_response_GET(200, body, false)
+    let resp = QUERY_ROUTER.with_borrow(|router| match router.at(path) {
+        Ok(route_handler_matching) => {
+            let route_handler = route_handler_matching.value;
+            let mut response = route_handler(&request, &route_handler_matching.params);
+            add_skip_certification_header(data_certificate().unwrap(), &mut response);
+            response
         }
-        _ => {
-            if path.starts_with("/getTodo") {
-                println!("Matched route: GET /getTodo");
-                match get_task_handler(&request.url) {
-                    Some(task) => {
-                        println!("Found task: {:?}", task);
-                        let json_str = serde_json::to_string(&task).unwrap();
-                        return json_response_GET(200, json_str, false);
-                    }
-                    None => {
-                        println!("Task not found");
-                        return create_not_found_response();
-                    }
-                };
+        Err(_) => UPDATE_ROUTER.with_borrow(|router| match router.at(path) {
+            Ok(_) => {
+                let mut upgrade_to_update_response = json_response_GET(200, "".to_string(), true);
+                add_skip_certification_header(
+                    data_certificate().unwrap(),
+                    &mut upgrade_to_update_response,
+                );
+                upgrade_to_update_response
             }
-            if path.starts_with("/deleteTodo")
-                || path.starts_with("/updateTodo")
-                || path.starts_with("/addnewTodo")
-            {
-                //Update the corresponding call to direct the `HttpGateway response` to `http_update_request` instead
-                return json_response_GET(200, "".to_string(), true);
+            Err(_) => {
+                let mut route_not_found = create_not_found_response();
+                add_skip_certification_header(data_certificate().unwrap(), &mut route_not_found);
+                route_not_found
             }
-
-            println!("No matching route found for {} {}", method, path);
-            create_not_found_response()
-        }
-    };
-
-    add_skip_certification_header(data_certificate().unwrap(), &mut response);
-    ic_cdk::println!(
-        "Response generated for the corresponding request - {:?}",
-        response
-    );
-    response
+        }),
+    });
+    resp
 }
 ic_cdk::export_candid!();
