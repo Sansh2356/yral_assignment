@@ -1,3 +1,4 @@
+#![allow(unused)]
 use candid::{CandidType, Deserialize};
 use ic_cdk::api::{certified_data_set, data_certificate};
 use ic_cdk::println;
@@ -5,12 +6,18 @@ use ic_http_certification::{
     utils::{add_skip_certification_header, skip_certification_certified_data},
     HttpResponse,
 };
+use ic_stable_structures::Cell;
+use ic_stable_structures::{
+    memory_manager::{MemoryId, MemoryManager, VirtualMemory},
+    DefaultMemoryImpl, StableBTreeMap, Storable,
+};
 use regex::Regex;
 use serde::Serialize;
+use std::ops::DerefMut;
 use std::{borrow::Cow, cell::RefCell, collections::HashMap};
 pub mod error;
 /*
-For generating the candid files one can use the following instructions 
+For generating the candid files one can use the following instructions
 1)cargo install candid-extractor
 2)ic_cdk::export_candid!(); (Add this macro for the generation)
 3)cargo install generate-did
@@ -33,67 +40,108 @@ pub struct HttpUpdateRequest {
     pub headers: Vec<HeaderField>,
     pub body: Vec<u8>,
 }
+
+pub type TodoId = u64;
+pub type Memory = VirtualMemory<DefaultMemoryImpl>;
 #[derive(Clone, Debug, CandidType, Deserialize, Serialize)]
 pub struct Todo {
-    pub id: u64,
+    pub id: TodoId,
     pub text: String,
+}
+//Implementing trait bound for todo for stable storage #[derive(Clone, Debug, CandidType, Deserialize)]
+
+impl Storable for Todo {
+    const BOUND: ic_stable_structures::storable::Bound =
+        ic_stable_structures::storable::Bound::Unbounded;
+    fn to_bytes(&self) -> Cow<'_, [u8]> {
+        let todo_struct_bytes = match candid::encode_one(self) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                panic!("Unable to parse the corresponding struct");
+            }
+        };
+        Cow::Owned(todo_struct_bytes)
+    }
+    fn into_bytes(self) -> Vec<u8> {
+        let todo_struct_bytes = match candid::encode_one(self) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                panic!("Unable to parse the corresponding struct");
+            }
+        };
+        todo_struct_bytes
+    }
+    fn from_bytes(bytes: Cow<[u8]>) -> Self {
+        let serialized_struct: Todo = match candid::decode_one(&*bytes) {
+            Ok(todo_serialized_struct) => todo_serialized_struct,
+            Err(error) => {
+                panic!(
+                    "An error occurred while serializing from bytes - {:?}",
+                    error
+                );
+            }
+        };
+
+        serialized_struct
+    }
 }
 //TODO: Memory will be changed after initial commits
 thread_local! {
-    static TODOS: RefCell<HashMap<u64, Todo>> = RefCell::new(HashMap::new());
-    static NEXT_ID:RefCell<u64> = RefCell::new(u64::from_str_radix("1", 16).unwrap());
+    static MEMORY_MANAGER: RefCell<MemoryManager<DefaultMemoryImpl>> =
+    RefCell::new(MemoryManager::init(DefaultMemoryImpl::default()));
+    static TODOS: RefCell<StableBTreeMap<u64, Todo, Memory>> = RefCell::new(
+        StableBTreeMap::init(
+            MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(0)))
+        )
+    );
+    static NEXT_ID: RefCell<Cell<u64, Memory>> = RefCell::new(
+        Cell::init(
+            MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(1))),
+            1,
+        )
+    );
+    // static TODOS: RefCell<HashMap<u64, Todo>> = RefCell::new(HashMap::new());
+    // static NEXT_ID:RefCell<u64> = RefCell::new(u64::from_str_radix("1", 16).unwrap());
 }
 #[ic_cdk::init]
 fn init() {
-    println!("Canister init: Flushing all states before initialization...");
     certified_data_set(&skip_certification_certified_data());
-
-    TODOS.with(|todos| {
-        todos.borrow_mut().clear();
-        println!("Cleared all TODOS");
-    });
-
-    NEXT_ID.with(|counter| {
-        *counter.borrow_mut() = 1;
-        println!("Reset NEXT_ID to 1");
-    });
-
-    println!("Initialization complete.");
+    println!("Canister Initialization complete.");
 }
 #[ic_cdk::update]
 fn add_todo(todo_text: String) -> u64 {
     println!("Adding new todo with text: {}", todo_text);
     NEXT_ID.with(|counter| {
-        let mut id = counter.borrow_mut();
-        let new_id = *id;
+        let mut ref_binding = counter.borrow_mut();
+        let mut id = ref_binding.get();
+        let mut new_id = *id;
         println!("Generated new todo id: {}", new_id);
 
         let todo = Todo {
             id: new_id,
             text: todo_text,
         };
-
         TODOS.with(|todos| {
             println!("Inserting todo into TODOS: {:?}", todo);
             todos.borrow_mut().insert(new_id, todo);
         });
-
-        *id += 1;
-        println!("Updated NEXT_ID to: {}", *id);
+        new_id += 1;
+        ref_binding.set(new_id);
+        println!("Updated NEXT_ID to: {}", new_id);
         new_id
     })
 }
 #[ic_cdk::query]
 fn get_todo(id: u64) -> Option<Todo> {
     println!("Fetching todo with id: {}", id);
-    TODOS.with(|todos| todos.borrow().get(&id).cloned())
+    TODOS.with(|todos| todos.borrow().get(&id))
 }
 
 #[ic_cdk::query]
 fn list_todos_paginated(page: u64, limit: u64) -> Vec<Todo> {
     println!("Listing todos page: {}, limit: {}", page, limit);
     TODOS.with(|todos| {
-        let todos_vec: Vec<Todo> = todos.borrow().values().cloned().collect();
+        let todos_vec: Vec<Todo> = todos.borrow().values().collect();
         println!("Total todos available: {}", todos_vec.len());
         let start = ((page.saturating_sub(1)) * limit) as usize;
         let end = std::cmp::min(start + (limit as usize), todos_vec.len());
@@ -111,9 +159,14 @@ fn update_todo(id: u64, new_text: String) -> bool {
     println!("Updating todo with id: {} to new text: {}", id, new_text);
     TODOS.with(|todos| {
         let mut todos = todos.borrow_mut();
-        if let Some(todo) = todos.get_mut(&id) {
+        if let Some(todo) = todos.get(&id) {
             println!("Found todo: {:?}, updating text", todo);
-            todo.text = new_text;
+            let new_todo = Todo {
+                text: new_text,
+                id: todo.id,
+            };
+            todos.remove(&todo.id);
+            todos.insert(todo.id, new_todo);
             true
         } else {
             println!("Todo with id {} not found", id);
@@ -136,7 +189,7 @@ fn delete_todo(id: u64) -> bool {
 #[ic_cdk::query]
 fn get_all_todos() -> Vec<Todo> {
     println!("Fetching all todos");
-    TODOS.with(|todos| todos.borrow().values().cloned().collect())
+    TODOS.with(|todos| todos.borrow().values().collect())
 }
 
 // Function to provide random id corresponding to each todo-entry.
@@ -188,11 +241,11 @@ fn get_task_handler(url: &str) -> Option<Todo> {
             println!("Extracted id from URL: {}", matched_id.as_str());
             if let Ok(task_id_parsed) = matched_id.as_str().parse::<u64>() {
                 println!("Parsed id: {}", task_id_parsed);
-                if let Some(fethced_task) =
-                    TODOS.with(|todo_task| todo_task.borrow().get(&task_id_parsed).cloned())
+                if let Some(fetched_task) =
+                    TODOS.with(|todo_task| todo_task.borrow().get(&task_id_parsed))
                 {
-                    println!("Found todo: {:?}", fethced_task);
-                    return Some(fethced_task);
+                    println!("Found todo: {:?}", fetched_task);
+                    return Some(fetched_task);
                 } else {
                     println!("Todo not found for id: {}", task_id_parsed);
                 }
@@ -321,7 +374,7 @@ fn http_request(request: HttpRequest) -> ic_http_certification::HttpResponse<'st
     let mut response = match (method, path) {
         ("GET", "/allTodos") => {
             println!("Matched route: GET /allTodos");
-            let todos = TODOS.with(|todos| todos.borrow().values().cloned().collect::<Vec<Todo>>());
+            let todos = TODOS.with(|todos| todos.borrow().values().collect::<Vec<Todo>>());
             println!("Fetched todos: {:?}", todos);
             let body = serde_json::to_string(&todos).unwrap();
             json_response_GET(200, body, false)
