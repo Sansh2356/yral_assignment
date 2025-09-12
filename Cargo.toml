@@ -1,0 +1,5 @@
+[workspace]
+members = [
+    "src/todo_crud_backend"
+]
+resolver = "2"
