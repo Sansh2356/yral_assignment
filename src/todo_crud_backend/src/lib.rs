@@ -2,6 +2,7 @@
 use candid::{CandidType, Deserialize};
 use ic_cdk::api::{certified_data_set, data_certificate};
 use ic_cdk::println;
+use ic_http_certification::StatusCode;
 use ic_http_certification::{
     utils::{add_skip_certification_header, skip_certification_certified_data},
     HttpResponse,
@@ -14,9 +15,11 @@ use ic_stable_structures::{
 use matchit::{Params, Router};
 use regex::Regex;
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{json, Error};
 use std::ops::{Bound, DerefMut};
 use std::{borrow::Cow, cell::RefCell, collections::HashMap};
+
+use crate::error::TodoApiError;
 pub mod error;
 /*
 For generating the candid files one can use the following instructions
@@ -50,8 +53,7 @@ pub struct Todo {
     pub id: TodoId,
     pub text: String,
 }
-//Implementing trait bound for todo for stable storage #[derive(Clone, Debug, CandidType, Deserialize)]
-
+//Implementing trait bound for todo for stable storage 
 impl Storable for Todo {
     const BOUND: ic_stable_structures::storable::Bound =
         ic_stable_structures::storable::Bound::Unbounded;
@@ -87,16 +89,22 @@ impl Storable for Todo {
         serialized_struct
     }
 }
-pub type RouteHandler = for<'a> fn(&'a HttpRequest, &'a Params) -> HttpResponse<'static>;
-//TODO: Memory will be changed after initial commits
+//Functional pointer mapping wrt the route handler for each of the route
+pub type RouteHandler =
+    for<'a> fn(&'a HttpRequest, &'a Params) -> Result<HttpResponse<'static>, TodoApiError>;
 thread_local! {
+    //Initializing the stable memory manager
     static MEMORY_MANAGER: RefCell<MemoryManager<DefaultMemoryImpl>> =
     RefCell::new(MemoryManager::init(DefaultMemoryImpl::default()));
+    //Initializing the todos mapping for stable storage across of 
+    //canister update as well instead of the traditional `post_upgrade` and `pre_upgrade hooks` respectively
     static TODOS: RefCell<StableBTreeMap<u64, Todo, Memory>> = RefCell::new(
         StableBTreeMap::init(
             MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(0)))
         )
     );
+    //Incremental ID there is also a random function below which can be used to allot random ID's acting
+    //as the primary key instead
     static NEXT_ID: RefCell<Cell<u64, Memory>> = RefCell::new(
         Cell::init(
             MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(1))),
@@ -105,6 +113,7 @@ thread_local! {
     );
     //Simple zero copy routers instead of static matching of regex expressions
     static QUERY_ROUTER: RefCell<Router<RouteHandler>> = RefCell::new(Router::new());
+    //Update router for `update` canister calls
     static UPDATE_ROUTER: RefCell<Router<RouteHandler>> = RefCell::new(Router::new());
 
 }
@@ -138,11 +147,15 @@ fn build_update_router() {
 }
 #[ic_cdk::init]
 fn init() {
+    //Passing the skipped verification certificate instead to 
+    //surpass certificate verification
     certified_data_set(&skip_certification_certified_data());
+    //Initializing all the routers with the corresponding routes
     build_query_router();
     build_update_router();
-    println!("Canister Initialization complete.");
+    ic_cdk::println!("Canister Initialization complete.");
 }
+//canister-to-canister call handling 
 #[ic_cdk::update]
 fn add_todo(todo_text: String) -> u64 {
     println!("Adding new todo with text: {}", todo_text);
@@ -178,18 +191,24 @@ fn list_todos_paginated(page: u64, limit: u64) -> Vec<Todo> {
     TODOS.with(|todos| {
         println!("Total tasks present in mapping {}", todos.borrow().len());
         //The offset factor will be ((page_size-1)*limit)
-        let start = ((page - 1) * limit) as usize;
+        let start_offset = ((page - 1) * limit) as usize;
         //Handling the final case of exceeding the last page
-        let end = std::cmp::min(start + (limit as usize), todos.borrow().len() as usize);
-        println!("Pagination from {},{}", start, end);
-        if start >= todos.borrow().len() as usize {
-            println!("Start index exceeds todos length, returning empty list");
+        let end = std::cmp::min(
+            start_offset + (limit as usize),
+            todos.borrow().len() as usize,
+        );
+        println!("Pagination from {},{}", start_offset, end);
+        if start_offset >= todos.borrow().len() as usize {
+            println!("start_offset index exceeds todos length, returning empty list");
             vec![]
         } else {
             //Range based queries in `BTreeMap` instead
             todos
                 .borrow()
-                .values_range((Bound::Included(start as u64), Bound::Included(end as u64)))
+                .iter()
+                .skip(start_offset as usize)
+                .take(limit as usize)
+                .map(|todo_task| todo_task.value())
                 .collect()
         }
     })
@@ -268,26 +287,38 @@ fn json_response_GET(
             ("pragma".to_string(), "no-cache".to_string()),
         ],
     )
+    .with_status_code(StatusCode::from_u16(status).unwrap())
     .with_upgrade(update_call_or_not)
     .build()
 }
-fn create_not_found_response() -> HttpResponse<'static> {
+fn create_not_found_response() -> Result<HttpResponse<'static>, TodoApiError> {
     println!("Creating Not Found response");
-    HttpResponse::not_found(
+    Ok(HttpResponse::not_found(
         Cow::Borrowed(b"Not Found" as &[u8]),
         vec![("Content-Type".to_string(), "text/plain".to_string())],
     )
-    .build()
+    .build())
 }
-fn get_task_handler(request: &HttpRequest, params: &Params) -> HttpResponse<'static> {
-    let task_id_parsed: u64 = params.get("id").unwrap().parse().unwrap();
+fn get_task_handler(
+    request: &HttpRequest,
+    params: &Params,
+) -> Result<HttpResponse<'static>, TodoApiError> {
+    let task_id_parsed: u64 = match params.get("id").unwrap().parse() {
+        Ok(parsed_val) => parsed_val,
+        Err(error) => {
+            return Err(TodoApiError::RequestParamNotParsed(
+                "GET task handler".to_string(),
+                "id".to_string(),
+                error.to_string(),
+            ));
+        }
+    };
     println!("Parsed id: {}", task_id_parsed);
 
-    println!("Parsed id: {}", task_id_parsed);
     if let Some(fetched_task) = TODOS.with(|todo_task| todo_task.borrow().get(&task_id_parsed)) {
         println!("Found todo: {:?}", fetched_task);
-        let json_str = serde_json::to_string(&fetched_task).unwrap();
-        return json_response_GET(200, json_str, false);
+        let json_str = serde_json::to_string(&fetched_task)?;
+        return Ok(json_response_GET(200, json_str, false));
     }
     println!(
         "No todo found in existing storage for id: {}",
@@ -295,69 +326,189 @@ fn get_task_handler(request: &HttpRequest, params: &Params) -> HttpResponse<'sta
     );
     return create_not_found_response();
 }
-fn paginated_read_task_handler(request: &HttpRequest, params: &Params) -> HttpResponse<'static> {
-    let page = params.get("page").unwrap().parse::<u64>().unwrap();
-    let limit = params.get("limit").unwrap().parse::<u64>().unwrap();
+fn paginated_read_task_handler(
+    request: &HttpRequest,
+    params: &Params,
+) -> Result<HttpResponse<'static>, TodoApiError> {
+    let page = match params.get("page").unwrap().parse::<u64>() {
+        Ok(parsed_value) => parsed_value,
+        Err(error) => {
+            return Err(TodoApiError::RequestParamNotParsed(
+                "paginated GET task handler".to_string(),
+                "page".to_string(),
+                error.to_string(),
+            ));
+        }
+    };
+    let limit = match params.get("limit").unwrap().parse::<u64>() {
+        Ok(parsed_value) => parsed_value,
+        Err(error) => {
+            return Err(TodoApiError::RequestParamNotParsed(
+                "paginated GET task handler".to_string(),
+                "limit".to_string(),
+                error.to_string(),
+            ));
+        }
+    };
+    //Limiting conditions before generating a response
+    if limit == 0 {
+        return Err(TodoApiError::InvalidLimit(
+            "paginated GET task handler".to_string(),
+            limit,
+        ));
+    }
+    if page == 0 {
+        return Err(TodoApiError::InvalidPage(
+            "paginated GET task handler".to_string(),
+            page,
+        ));
+    }
     let fetched_todo_vec = list_todos_paginated(page, limit);
-    let resp_body = serde_json::to_string(&fetched_todo_vec).unwrap();
+    let resp_body = match serde_json::to_string(&fetched_todo_vec) {
+        Ok(body) => body,
+        Err(error) => {
+            return Err(TodoApiError::ResponseBodyNotConvertedToJsonStr(
+                "paginated GET task handler".to_string(),
+                error.to_string(),
+            ));
+        }
+    };
 
-    json_response_GET(200, resp_body, false)
+    Ok(json_response_GET(200, resp_body, false))
 }
-fn delete_task_handler(request: &HttpRequest, params: &Params) -> HttpResponse<'static> {
-    let task_id_parsed: u64 = params.get("id").unwrap().parse().unwrap();
+fn delete_task_handler(
+    request: &HttpRequest,
+    params: &Params,
+) -> Result<HttpResponse<'static>, TodoApiError> {
+    let task_id_parsed: u64 = match params.get("id").unwrap().parse() {
+        Ok(parsed_value) => parsed_value,
+        Err(error) => {
+            return Err(TodoApiError::RequestParamNotParsed(
+                " DELETE task handler".to_string(),
+                "id".to_string(),
+                error.to_string(),
+            ));
+        }
+    };
     println!("Parsed id: {}", task_id_parsed);
     if let Some(_) = TODOS.with(|todo_tasks| todo_tasks.borrow_mut().remove(&task_id_parsed)) {
         println!("Deleted todo with id: {}", task_id_parsed);
-        return json_response_GET(200, true.to_string(), false);
+        return Ok(json_response_GET(200, true.to_string(), false));
     } else {
         println!("No todo found to delete for id: {}", task_id_parsed);
         return create_not_found_response();
     }
 }
-fn update_task_handler(request: &HttpRequest, params: &Params) -> HttpResponse<'static> {
-    let task_id_parsed: u64 = params.get("id").unwrap().parse().unwrap();
+fn update_task_handler(
+    request: &HttpRequest,
+    params: &Params,
+) -> Result<HttpResponse<'static>, TodoApiError> {
+    let task_id_parsed: u64 = match params.get("id").unwrap().parse() {
+        Ok(parsed_value) => parsed_value,
+        Err(error) => {
+            return Err(TodoApiError::RequestParamNotParsed(
+                "UPDATE task handler".to_string(),
+                "id".to_string(),
+                error.to_string(),
+            ));
+        }
+    };
     println!("Parsed id: {}", task_id_parsed);
     let body_json = String::from_utf8_lossy(&request.body);
     println!("Request body for update: {}", body_json);
-    let val: UpdateRequestBody = serde_json::from_str(&body_json).unwrap();
-
-    if let Some(_) = TODOS.with(|todo_tasks| {
+    let val: UpdateRequestBody = match serde_json::from_str(&body_json) {
+        Ok(body) => body,
+        Err(error) => {
+            return Err(TodoApiError::ResponseBodyNotConvertedToJsonStr(
+                "UPDATE task handler".to_string(),
+                error.to_string(),
+            ));
+        }
+    };
+    if let Some(present_or_not) = TODOS.with(|todo_tasks| {
         println!(
             "Updating todo with id {} to new text {}",
             task_id_parsed, val.new_text
         );
-        todo_tasks.borrow_mut().insert(
-            task_id_parsed,
-            Todo {
-                id: task_id_parsed,
-                text: val.new_text,
-            },
-        )
+        if todo_tasks.borrow().contains_key(&task_id_parsed) == true {
+            todo_tasks.borrow_mut().insert(
+                task_id_parsed,
+                Todo {
+                    id: task_id_parsed,
+                    text: val.new_text,
+                },
+            )
+        } else {
+            //No id found to be updated returning none
+            None
+        }
     }) {
         println!("Todo updated successfully for id: {}", task_id_parsed);
-        println!("Task updated successfully");
-        return json_response_GET(200, true.to_string(), false);
+        println!("Task updated successfully if present");
+        return Ok(json_response_GET(200, true.to_string(), false));
     }
     println!("Task update failed");
     return create_not_found_response();
 }
-fn get_all_todos_handler(request: &HttpRequest, params: &Params) -> HttpResponse<'static> {
+fn get_all_todos_handler(
+    request: &HttpRequest,
+    params: &Params,
+) -> Result<HttpResponse<'static>, TodoApiError> {
     println!("Matched route: GET /allTodos");
     let todos = TODOS.with(|todos| todos.borrow().values().collect::<Vec<Todo>>());
     println!("Fetched todos: {:?}", todos);
-    let body = serde_json::to_string(&todos).unwrap();
-    json_response_GET(200, body, false)
+    let body = match serde_json::to_string(&todos) {
+        Ok(bdy) => bdy,
+        Err(error) => {
+            return Err(TodoApiError::ResponseBodyNotConvertedToJsonStr(
+                "GET all todos".to_string(),
+                error.to_string(),
+            ));
+        }
+    };
+    Ok(json_response_GET(200, body, false))
 }
-fn add_new_task_handler(request: &HttpRequest, params: &Params) -> HttpResponse<'static> {
+fn add_new_task_handler(
+    request: &HttpRequest,
+    params: &Params,
+) -> Result<HttpResponse<'static>, TodoApiError> {
     let body_json = String::from_utf8_lossy(&request.body);
     println!("Request body for update: {}", body_json);
-    let val: UpdateRequestBody = serde_json::from_str(&body_json).unwrap();
+    let val: UpdateRequestBody = match serde_json::from_str(&body_json) {
+        Ok(body) => body,
+        Err(error) => {
+            return Err(TodoApiError::ResponseBodyNotConvertedToJsonStr(
+                "POST new task handler".to_string(),
+                error.to_string(),
+            ));
+        }
+    };
     let response_new_id = add_todo(val.new_text);
     let body_json = json!({
         "new_job_id":response_new_id,
     });
     let jsonify_body = serde_json::to_string(&body_json);
-    return json_response_GET(200, jsonify_body.unwrap(), false);
+    Ok(json_response_GET(200, jsonify_body.unwrap(), false))
+}
+//A standard response for an error that has been occurred at the route
+fn create_error_response(
+    request: &HttpRequest,
+    error: TodoApiError,
+) -> ic_http_certification::HttpResponse<'static> {
+    let body = json!({
+        "error": error.to_string(),
+        "path": request.url,
+        "method": request.method,
+    });
+
+    let body_str = serde_json::to_string(&body).unwrap_or_else(|_| {
+        format!(
+            r#"{{"error": "Failed to serialize error response: {}"}}"#,
+            error
+        )
+    });
+
+    json_response_GET(500, body_str, false)
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct UpdateRequestBody {
@@ -381,19 +532,21 @@ fn http_request_update(request: HttpRequest) -> ic_http_certification::HttpRespo
     let path = request.url.as_str();
     let method = request.method.as_str();
     println!("Request method: {}, path: {}", method, path);
-    let resp = UPDATE_ROUTER.with_borrow(|router| {
+    let resp = match UPDATE_ROUTER.with_borrow(|router| {
         match router.at(path) {
             Ok(route_handler_matching) => {
                 let route_handler = route_handler_matching.value;
                 let response = route_handler(&request, &route_handler_matching.params);
-                ic_cdk::println!("samdvncxvnxcnvc - {:?}", response);
                 return response;
             }
             Err(error) => {
                 panic!("{:?}", error);
             }
         };
-    });
+    }) {
+        Ok(handler_response) => handler_response,
+        Err(error) => create_error_response(&request, error),
+    };
     resp
 }
 #[ic_cdk::query]
@@ -405,7 +558,10 @@ fn http_request(request: HttpRequest) -> ic_http_certification::HttpResponse<'st
     let resp = QUERY_ROUTER.with_borrow(|router| match router.at(path) {
         Ok(route_handler_matching) => {
             let route_handler = route_handler_matching.value;
-            let mut response = route_handler(&request, &route_handler_matching.params);
+            let mut response = match route_handler(&request, &route_handler_matching.params) {
+                Ok(query_handler_response) => query_handler_response,
+                Err(error) => create_error_response(&request, error),
+            };
             add_skip_certification_header(data_certificate().unwrap(), &mut response);
             response
         }
@@ -419,12 +575,16 @@ fn http_request(request: HttpRequest) -> ic_http_certification::HttpResponse<'st
                 upgrade_to_update_response
             }
             Err(_) => {
-                let mut route_not_found = create_not_found_response();
+                let mut route_not_found = match create_not_found_response() {
+                    Ok(not_found_response) => not_found_response,
+                    Err(error) => create_error_response(&request, error),
+                };
                 add_skip_certification_header(data_certificate().unwrap(), &mut route_not_found);
                 route_not_found
             }
         }),
     });
+    ic_cdk::println!("Final response sent - {:?}", resp.body());
     resp
 }
 ic_cdk::export_candid!();
