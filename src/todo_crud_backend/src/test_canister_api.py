@@ -2,6 +2,7 @@ import requests
 import pytest
 import time
 
+#SAME TESTS AS IN lib.rs for RUST 
 #Replace the below with the local canister ID 
 #If any changes made to dfx.json regards to port of replica then change the port as well 
 #The ID returned is next id not the id with which the corresponding record was inserted with
@@ -14,7 +15,7 @@ Test can be run via -
 3)pytest -v 
 4)For a particular test case - pytest -v test_canister_api.py::test_pagination_with_invalid_params
 """
-CANISTER_ID = ""
+CANISTER_ID = "uxrrr-q7777-77774-qaaaq-cai"
 BASE_URL = f"http://{CANISTER_ID}.localhost:4943"
 
 #defining fixture for initializing the Session 
@@ -110,7 +111,6 @@ def test_update_nonexistent_todo(session):
     update_payload = {"new_text": "Test text"}
 
     update_response = session.put(update_url, json=update_payload)
-    # breakpoint()
     assert update_response.status_code == 404
 
     get_response = session.get(f"{BASE_URL}/getTodo/{non_existent_id}")
