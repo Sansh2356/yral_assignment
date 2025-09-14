@@ -16,3 +16,6 @@ ic-http-certification = "3.0.3"
 regex = "1.11.1"
 ic-stable-structures = "0.7.0"
 matchit = "0.8.6"
+#For testing purposes only
+[dev-dependencies]
+reqwest = {version = "0.12.23",features = ["blocking","json"]}

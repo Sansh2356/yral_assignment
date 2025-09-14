@@ -15,7 +15,7 @@ Test can be run via -
 3)pytest -v 
 4)For a particular test case - pytest -v test_canister_api.py::test_pagination_with_invalid_params
 """
-CANISTER_ID = "uxrrr-q7777-77774-qaaaq-cai"
+CANISTER_ID = ""
 BASE_URL = f"http://{CANISTER_ID}.localhost:4943"
 
 #defining fixture for initializing the Session 
