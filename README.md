@@ -47,7 +47,7 @@ Further more testing for canister can be done via PocketIC testnet locally by fo
 
 - A simple test can be made following this code snippet - 
   ```
-  fn setup() -> (PocketIc, Principal) {
+   fn setup() -> (PocketIc, Principal) {
     std::env::set_var("POCKET_IC_BIN", "YOUR_EXPORTED_PATH"); 
     let pocket_ic_instance = PocketIc::new();
 
